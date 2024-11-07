@@ -35,6 +35,7 @@ mod display;
 mod infer;
 mod mro;
 mod narrow;
+mod string_annotation;
 mod unpacker;
 
 pub fn check_types(db: &dyn Db, file: File) -> TypeCheckDiagnostics {
@@ -53,7 +54,7 @@ pub fn check_types(db: &dyn Db, file: File) -> TypeCheckDiagnostics {
 
 /// Infer the public type of a symbol (its type as seen from outside its scope).
 fn symbol_by_id<'db>(db: &'db dyn Db, scope: ScopeId<'db>, symbol: ScopedSymbolId) -> Symbol<'db> {
-    let _span = tracing::trace_span!("symbol_ty_by_id", ?symbol).entered();
+    let _span = tracing::trace_span!("symbol_by_id", ?symbol).entered();
 
     let use_def = use_def_map(db, scope);
 

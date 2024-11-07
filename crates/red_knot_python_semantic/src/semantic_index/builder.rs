@@ -47,6 +47,8 @@ pub(super) struct SemanticIndexBuilder<'db> {
     current_assignments: Vec<CurrentAssignment<'db>>,
     /// The match case we're currently visiting.
     current_match_case: Option<CurrentMatchCase<'db>>,
+    /// The visitor is currently visiting a type annotation.
+    in_type_annotation: bool,
 
     /// Flow states at each `break` in the current loop.
     loop_break_states: Vec<FlowSnapshot>,
@@ -79,6 +81,7 @@ impl<'db> SemanticIndexBuilder<'db> {
             current_match_case: None,
             loop_break_states: vec![],
             try_node_context_stack_manager: TryNodeContextStackManager::default(),
+            in_type_annotation: false,
 
             has_future_annotations: false,
 
@@ -445,6 +448,13 @@ impl<'db> SemanticIndexBuilder<'db> {
         self.pop_scope();
     }
 
+    fn visit_type_annotation(&mut self, expr: &'db ast::Expr) {
+        let was_in_type_annotation = self.in_type_annotation;
+        self.in_type_annotation = true;
+        self.visit_expr(expr);
+        self.in_type_annotation = was_in_type_annotation;
+    }
+
     fn declare_parameter(&mut self, parameter: AnyParameterRef<'db>) {
         let symbol = self.add_symbol(parameter.name().id().clone());
 
@@ -667,7 +677,7 @@ where
             }
             ast::Stmt::AnnAssign(node) => {
                 debug_assert_eq!(&self.current_assignments, &[]);
-                self.visit_expr(&node.annotation);
+                self.visit_type_annotation(&node.annotation);
                 if let Some(value) = &node.value {
                     self.visit_expr(value);
                 }
@@ -1190,6 +1200,10 @@ where
                 }
             }
             _ => {
+                if matches!(expr, ast::Expr::StringLiteral(_) if self.in_type_annotation) {
+                    self.add_standalone_expression(expr);
+                }
+
                 walk_expr(self, expr);
             }
         }
