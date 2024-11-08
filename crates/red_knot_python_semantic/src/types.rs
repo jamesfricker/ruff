@@ -1801,6 +1801,21 @@ impl<'db> IterationOutcome<'db> {
     }
 }
 
+#[derive(Debug)]
+enum AnnotationOutcome<'db> {
+    Type(Type<'db>),
+    Deferred,
+}
+
+impl<'db> AnnotationOutcome<'db> {
+    fn expect_type(self) -> Type<'db> {
+        match self {
+            AnnotationOutcome::Type(ty) => ty,
+            AnnotationOutcome::Deferred => panic!("expected a type, but got a deferred annotation"),
+        }
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum Truthiness {
     /// For an object `x`, `bool(x)` will always return `True`

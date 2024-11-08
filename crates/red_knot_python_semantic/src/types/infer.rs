@@ -54,8 +54,8 @@ use crate::types::mro::MroErrorKind;
 use crate::types::unpacker::{UnpackResult, Unpacker};
 use crate::types::{
     bindings_ty, builtins_symbol, declarations_ty, global_symbol, symbol, typing_extensions_symbol,
-    Boundness, BytesLiteralType, Class, ClassLiteralType, FunctionType, InstanceType,
-    IterationOutcome, KnownClass, KnownFunction, KnownInstance, MetaclassErrorKind,
+    AnnotationOutcome, Boundness, BytesLiteralType, Class, ClassLiteralType, FunctionType,
+    InstanceType, IterationOutcome, KnownClass, KnownFunction, KnownInstance, MetaclassErrorKind,
     SliceLiteralType, StringLiteralType, Symbol, Truthiness, TupleType, Type, TypeArrayDisplay,
     UnionBuilder, UnionType,
 };
@@ -610,7 +610,6 @@ impl<'db> TypeInferenceBuilder<'db> {
 
     fn infer_region_expression(&mut self, expression: Expression<'db>) {
         self.infer_expression_impl(expression.node_ref(self.db));
-        self.check_deferred();
     }
 
     fn check_deferred(&mut self) {
@@ -861,11 +860,12 @@ impl<'db> TypeInferenceBuilder<'db> {
             if self.are_all_types_deferred() {
                 self.deferred.push(definition);
             } else {
-                // TODO(sa): Check if any of the parameter annotation or the return type is
-                // stringified or contains forward references. They need to be deferred as well.
-                // This could be done using an AST traversal and will also require resolving
-                // imports to special case the logic for `typing.Literal` and `typing.Annotation`.
-                self.infer_optional_annotation_expression(returns.as_deref());
+                if matches!(
+                    self.infer_optional_annotation_expression(returns.as_deref()),
+                    Some(AnnotationOutcome::Deferred)
+                ) {
+                    self.deferred.push(definition);
+                }
             }
         }
 
@@ -1494,6 +1494,12 @@ impl<'db> TypeInferenceBuilder<'db> {
         }
     }
 
+    /// Infer the types in an annotated assignment definition.
+    ///
+    /// This will defer the inference of the annotation expression if:
+    /// - It is a string literal expression
+    /// - In a stub file
+    /// - The `__future__.annotations` feature is enabled
     fn infer_annotated_assignment_definition(
         &mut self,
         assignment: &ast::StmtAnnAssign,
@@ -1507,16 +1513,21 @@ impl<'db> TypeInferenceBuilder<'db> {
             simple: _,
         } = assignment;
 
-        let annotation_ty = self.infer_annotation_expression(annotation);
-
-        match annotation_ty {
-            AnnotationOutcome::Deferred => self.deferred.push(definition),
-            AnnotationOutcome::Type(annotation_ty) => {
-                self.add_annotated_assignment_declaration(assignment, annotation_ty, definition);
+        if self.are_all_types_deferred() {
+            self.deferred.push(definition);
+        } else {
+            match self.infer_annotation_expression(annotation) {
+                AnnotationOutcome::Deferred => self.deferred.push(definition),
+                AnnotationOutcome::Type(annotation_ty) => {
+                    self.add_annotated_assignment_declaration(
+                        assignment,
+                        annotation_ty,
+                        definition,
+                    );
+                    self.infer_expression(target);
+                }
             }
         }
-
-        self.infer_expression(target);
     }
 
     fn infer_annotated_assignment_deferred(
@@ -1526,35 +1537,50 @@ impl<'db> TypeInferenceBuilder<'db> {
     ) {
         let ast::StmtAnnAssign {
             range: _,
-            target: _,
+            target,
             annotation,
             value: _,
             simple: _,
         } = assignment;
 
-        let annotation_expression = self.index.expression(&**annotation);
+        // "Foo" -> Foo
+        // "SomeGeneric[Foo]" -> SomeGeneric[Foo]
+        // "'Foo'" -> 'Foo'
+        // "SomeGeneric['Foo']" -> SomeGeneric['Foo']
 
-        let annotation_ty = match parse_string_annotation(self.db, annotation_expression) {
-            Ok(parsed) => match self.infer_annotation_expression_no_store(parsed.expr()) {
-                AnnotationOutcome::Type(annotation_ty) => annotation_ty,
-                AnnotationOutcome::Deferred => {
-                    self.deferred.push(definition);
-                    return;
+        let annotation_ty = if let Some(string) = annotation.as_string_literal_expr() {
+            let annotation_ty = match parse_string_annotation(self.db, self.file, string) {
+                Ok(parsed) => match self.infer_annotation_expression_no_store(parsed.expr()) {
+                    AnnotationOutcome::Type(ty) => ty,
+                    AnnotationOutcome::Deferred => {
+                        debug_assert!(parsed.expr().is_string_literal_expr());
+                        self.diagnostics.add(
+                            parsed.expr().into(),
+                            "nested-string-annotation",
+                            format_args!("Nested string annotations are not supported"),
+                        );
+                        Type::Unknown
+                    }
+                },
+                Err(diagnostics) => {
+                    self.diagnostics.extend(&diagnostics);
+                    Type::Unknown
                 }
-            },
-            Err(diagnostics) => {
-                self.diagnostics.extend(diagnostics);
-                Type::Unknown
-            }
+            };
+
+            // We don't store the expression type when `infer_annotation_expression` is called for the
+            // first time because it would return `Deferred`. So, now as we're in the deferred region,
+            // we need to store it and we will do so on the original string expression instead of the
+            // parsed expression because the latter doesn't exists in the semantic index.
+            self.store_expression_type(annotation, annotation_ty);
+
+            annotation_ty
+        } else {
+            self.infer_annotation_expression(annotation).expect_type()
         };
 
-        // We don't store the expression type when `infer_annotation_expression` is called for the
-        // first time because it would return `Deferred`. So, now as we're in the deferred region,
-        // we need to store it and we will do so on the original string expression instead of the
-        // parsed expression because the latter doesn't exists in the semantic index.
-        self.store_expression_type(annotation, annotation_ty);
-
         self.add_annotated_assignment_declaration(assignment, annotation_ty, definition);
+        self.infer_expression(target);
     }
 
     fn add_annotated_assignment_declaration(
@@ -3875,12 +3901,6 @@ impl<'db> TypeInferenceBuilder<'db> {
     }
 }
 
-#[derive(Debug)]
-enum AnnotationOutcome<'db> {
-    Type(Type<'db>),
-    Deferred,
-}
-
 /// Annotation expressions.
 impl<'db> TypeInferenceBuilder<'db> {
     fn infer_annotation_expression(&mut self, expression: &ast::Expr) -> AnnotationOutcome<'db> {
@@ -5617,28 +5637,5 @@ mod tests {
             &events,
         );
         Ok(())
-    }
-
-    #[test]
-    fn debug() {
-        let mut db = setup_db();
-
-        db.write_file(
-            "/src/a.py",
-            "
-from typing import reveal_type
-
-x: 'Foo'
-
-
-class Foo:
-    pass
-",
-        )
-        .unwrap();
-
-        let a = system_path_to_file(&db, "/src/a.py").unwrap();
-        let x_ty = global_symbol(&db, a, "x").expect_type();
-        println!("x_ty: {:?}", x_ty.display(&db));
     }
 }

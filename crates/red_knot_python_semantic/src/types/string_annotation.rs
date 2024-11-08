@@ -1,12 +1,10 @@
+use ruff_db::files::File;
 use ruff_db::source::source_text;
 use ruff_python_ast::str::raw_contents;
-use ruff_python_ast::{ModExpression, StringFlags};
+use ruff_python_ast::{self as ast, ModExpression, StringFlags};
 use ruff_python_parser::{parse_expression_range, Parsed};
 use ruff_text_size::Ranged;
 
-use salsa::plumbing::AsId;
-
-use crate::semantic_index::expression::Expression;
 use crate::types::diagnostic::{TypeCheckDiagnostics, TypeCheckDiagnosticsBuilder};
 use crate::Db;
 
@@ -17,25 +15,17 @@ type AnnotationParseResult = Result<Parsed<ModExpression>, TypeCheckDiagnostics>
 /// # Panics
 ///
 /// Panics if the expression is not a string literal.
-#[salsa::tracked(return_ref, no_eq)]
-pub(crate) fn parse_string_annotation<'db>(
-    db: &'db dyn Db,
-    expression: Expression<'db>,
+pub(crate) fn parse_string_annotation(
+    db: &dyn Db,
+    file: File,
+    string_expr: &ast::ExprStringLiteral,
 ) -> AnnotationParseResult {
-    let file = expression.file(db);
-    let _span =
-        tracing::trace_span!("parse_string_annotation", expression=?expression.as_id(), file=%file.path(db))
-            .entered();
+    let _span = tracing::trace_span!("parse_string_annotation", string=?string_expr.range(), file=%file.path(db)).entered();
 
     let source = source_text(db.upcast(), file);
-    let node = expression.node_ref(db).node();
-    let Some(string_expr) = node.as_string_literal_expr() else {
-        panic!("Expected a string literal expression");
-    };
-
+    let node_text = &source[string_expr.range()];
     let mut diagnostics = TypeCheckDiagnosticsBuilder::new(db, file);
 
-    let node_text = &source[string_expr.range()];
     if let [string_literal] = string_expr.value.as_slice() {
         let prefix = string_literal.flags.prefix();
         if prefix.is_raw() {
